@@ -1,0 +1,154 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code from GitHub...'
+
+                git branch: 'main',
+                    url: 'https://github.com/siddananjesh/java-cicd-demo.git'
+            }
+        }
+
+        stage('Build and Test') {
+            steps {
+                echo 'Building Java application and running tests...'
+
+                sh 'mvn -B clean verify'
+
+                sh 'test -f target/app.jar'
+
+                echo 'Build and tests completed successfully.'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                echo 'Starting SonarQube analysis...'
+
+                withSonarQubeEnv('sonar-server') {
+                    sh '''
+                        mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
+                          -Dsonar.projectKey=java-cicd-demo
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                echo 'Waiting for SonarQube Quality Gate result...'
+
+                timeout(time: 10, unit: 'MINUTES') {
+                    script {
+                        def qualityGate = waitForQualityGate(
+                            abortPipeline: true
+                        )
+
+                        echo "Quality Gate status: ${qualityGate.status}"
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Dependency Scan') {
+            steps {
+                echo 'Scanning project dependencies for HIGH and CRITICAL vulnerabilities...'
+
+                sh '''
+                    trivy fs \
+                        --scanners vuln \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        .
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo 'Building Docker image...'
+
+                sh '''
+                    docker build -t java-cicd-demo:${BUILD_NUMBER} .
+                '''
+
+                echo 'Docker image built successfully.'
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                echo 'Scanning Docker image for HIGH and CRITICAL vulnerabilities...'
+
+                sh '''
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        java-cicd-demo:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+                echo 'Deploying the application container...'
+
+                sh '''
+                    docker rm -f java-cicd-demo || true
+
+                    docker run -d \
+                        --name java-cicd-demo \
+                        --restart unless-stopped \
+                        -p 8082:8080 \
+                        java-cicd-demo:${BUILD_NUMBER}
+                '''
+
+                echo 'Container deployment command completed.'
+            }
+        }
+
+        stage('Health Check') {
+            steps {
+                echo 'Checking application health...'
+
+                sh '''
+                    for i in $(seq 1 20); do
+                        if curl --fail --silent http://localhost:8082/health; then
+                            echo
+                            echo "Application is healthy."
+                            exit 0
+                        fi
+
+                        sleep 3
+                    done
+
+                    echo "Application health check failed."
+                    docker logs java-cicd-demo
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'SUCCESS: Build, tests, SonarQube, Quality Gate, Trivy scans, Docker build, deployment, and health check completed successfully.'
+        }
+
+        failure {
+            echo 'FAILURE: Pipeline failed. Check Console Output to identify the failed stage.'
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
+        }
+    }
+}
